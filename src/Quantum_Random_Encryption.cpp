@@ -1,14 +1,20 @@
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <curl/curl.h>
 #include <fstream>
 #include <iostream>
+#include <limits.h>
 #include <sodium.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
+
+#include "password_blacklist.hpp"
 
 //
 // SECURE MEMORY UTILITIES
@@ -32,6 +38,19 @@ void secure_wipe_vector(std::vector<unsigned char> &v) {
 
 // Securely delete file by overwriting with random data before deletion
 bool secure_delete_file(const std::string &filename) {
+  // SECURITY: Check for symlinks to prevent TOCTOU attacks
+  struct stat path_stat;
+  if (lstat(filename.c_str(), &path_stat) != 0) {
+    return false; // File doesn't exist or error
+  }
+
+  if (S_ISLNK(path_stat.st_mode)) {
+    std::cerr << "SECURITY ERROR: " << filename
+              << " is a symbolic link! Refusing to securely delete."
+              << std::endl;
+    return false;
+  }
+
   std::fstream file(filename, std::ios::in | std::ios::out | std::ios::binary);
   if (!file) {
     return false; // File doesn't exist or can't be opened
@@ -59,16 +78,53 @@ bool secure_delete_file(const std::string &filename) {
   return remove(filename.c_str()) == 0;
 }
 
-// Validate file path to prevent path traversal
+// Validate file path to prevent path traversal attacks
 bool is_safe_path(const std::string &path) {
-  // Reject paths with parent directory references
+  // Reject paths with parent directory references (first line of defense)
   if (path.find("..") != std::string::npos) {
     return false;
   }
+
   // Reject absolute paths starting with /
   if (!path.empty() && path[0] == '/') {
     return false;
   }
+
+  // SECURITY: Use canonical path resolution to detect symlink attacks
+  // Note: This only works if the path exists, so we do basic checks first
+  char resolved[PATH_MAX];
+  char cwd[PATH_MAX];
+
+  // Get current working directory
+  if (getcwd(cwd, sizeof(cwd)) == nullptr) {
+    // If we can't get CWD, be conservative and reject
+    return false;
+  }
+
+  // Try to resolve the path (works for existing files)
+  // For non-existent files (e.g., output files), check parent directory
+  if (realpath(path.c_str(), resolved) != nullptr) {
+    // Path exists - verify it's within current directory
+    size_t cwd_len = strlen(cwd);
+    if (strncmp(resolved, cwd, cwd_len) != 0) {
+      return false; // Path escapes current directory
+    }
+  } else {
+    // Path doesn't exist - check the parent directory
+    std::string parent_path = path;
+    size_t last_slash = parent_path.find_last_of("/\\");
+    if (last_slash != std::string::npos) {
+      parent_path = parent_path.substr(0, last_slash);
+      if (realpath(parent_path.c_str(), resolved) != nullptr) {
+        size_t cwd_len = strlen(cwd);
+        if (strncmp(resolved, cwd, cwd_len) != 0) {
+          return false; // Parent escapes current directory
+        }
+      }
+    }
+    // If no parent or parent doesn't exist, rely on basic checks above
+  }
+
   return true;
 }
 
@@ -100,9 +156,11 @@ public:
 
   ~SecurePassword() {
     // Securely wipe password
-    sodium_memzero(data, capacity);
-    munlock(data, capacity);
-    delete[] data;
+    if (data) {
+      sodium_memzero(data, capacity);
+      munlock(data, capacity); // Only if data is valid
+      delete[] data;
+    }
   }
 
   // Prevent copying
@@ -186,12 +244,19 @@ const size_t CHUNK_SIZE = 1024 * 1024; // 1MB chunks
 const size_t STREAM_THRESHOLD =
     100 * 1024 * 1024; // Use streaming for files > 100MB
 const size_t PROGRESS_UPDATE_INTERVAL = 64 * 1024; // Update progress every 64KB
+const size_t PROGRESS_BAR_THRESHOLD =
+    128 * 1024; // Show progress bar for files > 128KB
 
 // File format version
-const unsigned char FILE_FORMAT_VERSION = 0x01;
+const unsigned char FILE_FORMAT_VERSION = 0x02;
 
 // Global verbose flag (set via command line)
 bool VERBOSE = false;
+
+// Compile-time safety checks
+static_assert(KEY_SIZE % 32 == 0,
+              "KEY_SIZE must be divisible by 32 for SHA-256 key derivation");
+static_assert(ENCRYPTION_ROUNDS > 0, "ENCRYPTION_ROUNDS must be positive");
 
 //
 // PROGRESS DISPLAY
@@ -201,9 +266,10 @@ void show_progress(const std::string &operation, size_t current, size_t total) {
   if (total == 0)
     return;
 
-  int percent = (current * 100) / total;
+  // Use 64-bit arithmetic to prevent overflow for very large files
+  int percent = (int)((current * 100ULL) / total);
   int bar_width = 20;
-  int filled = (current * bar_width) / total;
+  int filled = (int)(((unsigned long long)current * bar_width) / total);
 
   // Format sizes in MB
   double current_mb = current / (1024.0 * 1024.0);
@@ -245,6 +311,14 @@ size_t QRNGWriteCallback(void *contents, size_t size, size_t nmemb,
                          void *userp) {
   size_t totalSize = size * nmemb;
   std::string *buffer = (std::string *)userp;
+
+  // SECURITY: Limit response size to 1MB (prevents DoS from malicious server)
+  // Normal response for 128 bytes is ~1KB, so 1MB is very generous
+  if (buffer->size() + totalSize > 1024 * 1024) {
+    std::cerr << "QRNG response too large, aborting" << std::endl;
+    return 0; // Abort transfer
+  }
+
   buffer->append((char *)contents, totalSize);
   return totalSize;
 }
@@ -259,7 +333,17 @@ std::vector<unsigned char> fetch_system_random(size_t num_bytes) {
     exit(1);
   }
 
+  // SECURITY: Critical fix - check for short reads!
+  // /dev/urandom can return fewer bytes than requested on some systems
   urandom.read((char *)result.data(), num_bytes);
+  size_t bytes_read = urandom.gcount();
+
+  if (bytes_read != num_bytes) {
+    std::cerr << "CRITICAL ERROR: /dev/urandom returned only " << bytes_read
+              << " bytes instead of " << num_bytes << std::endl;
+    exit(1);
+  }
+
   urandom.close();
 
   return result;
@@ -286,6 +370,12 @@ bool ask_user_fallback() {
   char choice;
   std::cin >> choice;
 
+  // Check for input failure
+  if (std::cin.fail()) {
+    std::cerr << "\nInput error. Aborting." << std::endl;
+    return false;
+  }
+
   // Clear input buffer
   std::cin.ignore(10000, '\n');
 
@@ -309,7 +399,9 @@ std::vector<unsigned char> fetch_qrng_bytes(size_t num_bytes) {
   curl_easy_setopt(curl, CURLOPT_URL, qrng_url.c_str());
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, QRNGWriteCallback);
   curl_easy_setopt(curl, CURLOPT_WRITEDATA, &qrngBuffer); // Pass local buffer
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
+
+  // SECURITY: Only allow HTTPS (use modern API for libcurl 7.85.0+)
+  curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "https");
 
   // Enhanced certificate verification (but don't be too strict)
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L); // Verify certificate
@@ -322,9 +414,6 @@ std::vector<unsigned char> fetch_qrng_bytes(size_t num_bytes) {
   // SECURITY: Timeout configuration (prevent hanging)
   curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L); // 10s connection timeout
   curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);        // 30s total timeout
-
-  // SECURITY: Only allow HTTPS
-  curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
 
   // Fetch enough blocks (1024 bits = 128 bytes per request)
   size_t blocks_needed = (num_bytes + 127) / 128;
@@ -398,21 +487,59 @@ std::vector<unsigned char> fetch_qrng_bytes(size_t num_bytes) {
 }
 
 //
+// FILE UTILITIES
+//
+
+std::string extract_extension(const std::string &filename) {
+  size_t dot_pos = filename.find_last_of('.');
+  if (dot_pos != std::string::npos && dot_pos < filename.length() - 1) {
+    // Check for path separators after the dot (e.g. /path.to/file)
+    size_t sep_pos = filename.find_last_of("/\\");
+    if (sep_pos != std::string::npos && sep_pos > dot_pos) {
+      return ""; // Dot was in directory name
+    }
+    return filename.substr(dot_pos); // Returns ".jpg", ".txt", etc.
+  }
+  return ""; // No extension
+}
+
+//
 // INPUT/OUTPUT UTILITIES
 //
 
+// RAII guard to ensure terminal echo is restored even on exceptions
+class TerminalEchoGuard {
+private:
+  struct termios old_term;
+  bool active;
+
+public:
+  TerminalEchoGuard() : active(false) {
+    if (tcgetattr(STDIN_FILENO, &old_term) == 0) {
+      struct termios new_term = old_term;
+      new_term.c_lflag &= ~ECHO;
+      if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) == 0) {
+        active = true;
+      }
+    }
+  }
+
+  ~TerminalEchoGuard() {
+    if (active) {
+      tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
+    }
+  }
+
+  // Prevent copying
+  TerminalEchoGuard(const TerminalEchoGuard &) = delete;
+  TerminalEchoGuard &operator=(const TerminalEchoGuard &) = delete;
+};
+
 std::string get_password_hidden() {
-  struct termios old_term, new_term;
+  TerminalEchoGuard guard; // RAII ensures restoration even on exception
   std::string password;
 
-  tcgetattr(STDIN_FILENO, &old_term);
-  new_term = old_term;
-  new_term.c_lflag &= ~ECHO;
-  tcsetattr(STDIN_FILENO, TCSANOW, &new_term);
-
   std::getline(std::cin, password);
-
-  tcsetattr(STDIN_FILENO, TCSANOW, &old_term);
   std::cout << std::endl;
 
   return password;
@@ -439,8 +566,9 @@ std::vector<unsigned char> derive_key(const char *password, size_t password_len,
                                       const std::vector<unsigned char> &salt) {
   std::vector<unsigned char> key(KEY_SIZE);
 
-  // Lock key in memory
-  if (mlock(key.data(), KEY_SIZE) != 0) {
+  // Lock key in memory (track success for cleanup)
+  bool key_locked = (mlock(key.data(), KEY_SIZE) == 0);
+  if (!key_locked) {
     std::cerr << "Warning: mlock failed for key (consider running with sudo)"
               << std::endl;
   }
@@ -459,7 +587,9 @@ std::vector<unsigned char> derive_key(const char *password, size_t password_len,
                     ) != 0) {
     std::cerr << "Argon2id key derivation failed (out of memory)" << std::endl;
     sodium_memzero(key.data(), KEY_SIZE);
-    munlock(key.data(), KEY_SIZE);
+    if (key_locked) {
+      munlock(key.data(), KEY_SIZE); // Only unlock if we locked it
+    }
     exit(1);
   }
 
@@ -614,6 +744,13 @@ bool verify_hmac(const std::vector<unsigned char> &data,
 //
 
 bool validate_password(const std::string &password, std::string &error_msg) {
+  // SECURITY: Check against blacklist of common weak passwords
+  if (PASSWORD_BLACKLIST.find(password) != PASSWORD_BLACKLIST.end()) {
+    error_msg = "This password is too common and easily guessable. Please "
+                "choose a more unique password.";
+    return false;
+  }
+
   if (password.length() < MIN_PASSWORD_LENGTH) {
     error_msg = "Password must be at least " +
                 std::to_string(MIN_PASSWORD_LENGTH) + " characters long";
@@ -622,7 +759,13 @@ bool validate_password(const std::string &password, std::string &error_msg) {
 
   int uppercase = 0, lowercase = 0, digits = 0, symbols = 0;
 
+  // SECURITY: Reject non-printable characters (prevents bypass attacks)
   for (char c : password) {
+    if (!isprint(static_cast<unsigned char>(c)) && c != ' ') {
+      error_msg = "Password contains invalid non-printable characters";
+      return false;
+    }
+
     if (isupper(c))
       uppercase++;
     else if (islower(c))
@@ -702,12 +845,15 @@ SecurePassword get_password_for_decryption() {
   sodium_memzero(&temp_password[0], temp_password.size());
   temp_password.clear();
 
+  // SECURITY: Sleep BEFORE validation for constant-time defense against timing
+  // attacks
+  sleep(DELAY_SECONDS);
+
   if (password.empty()) {
     std::cerr << "Password cannot be empty!" << std::endl;
     exit(1);
   }
 
-  sleep(DELAY_SECONDS);
   return password;
 }
 
@@ -780,6 +926,32 @@ std::string auto_generate_output_filename(const std::string &input,
     }
     return input + ".qre";
   } else {
+    // Decrypt mode: Try to recover original extension from header
+    std::ifstream infile(input, std::ios::binary);
+    if (infile) {
+      unsigned char ver;
+      infile.read((char *)&ver, 1);
+      if (infile.gcount() == 1 && ver == 0x02) {
+        unsigned char ext_len;
+        infile.read((char *)&ext_len, 1);
+        if (infile.gcount() == 1 && ext_len > 0) {
+          std::vector<char> ext_buf(ext_len);
+          infile.read(ext_buf.data(), ext_len);
+          if (infile.gcount() == ext_len) {
+            std::string stored_ext(ext_buf.begin(), ext_buf.end());
+
+            // Remove .qre if present
+            std::string base = input;
+            if (base.length() > 4 && base.substr(base.length() - 4) == ".qre") {
+              base = base.substr(0, base.length() - 4);
+            }
+            return base + stored_ext;
+          }
+        }
+      }
+    }
+
+    // Fallback if no extension stored
     if (input.size() > 4 && input.substr(input.size() - 4) == ".qre") {
       return input.substr(0, input.size() - 4) + ".txt";
     }
@@ -787,12 +959,26 @@ std::string auto_generate_output_filename(const std::string &input,
   }
 }
 
-// Helper: Get file size
+// Helper: Get file size with overflow protection
 size_t get_file_size(const std::string &filename) {
   std::ifstream file(filename, std::ios::binary | std::ios::ate);
   if (!file)
     return 0;
-  return file.tellg();
+
+  // SECURITY: Check for integer overflow on file size
+  auto pos = file.tellg();
+  if (pos < 0) {
+    std::cerr << "Error reading file size" << std::endl;
+    return 0;
+  }
+
+  // Check if file size exceeds SIZE_MAX (prevents overflow)
+  if (static_cast<uintmax_t>(pos) > SIZE_MAX) {
+    std::cerr << "File too large for this system" << std::endl;
+    return 0;
+  }
+
+  return static_cast<size_t>(pos);
 }
 
 //
@@ -810,59 +996,39 @@ void perform_encryption(const std::string &input_file,
   }
   test_file.close();
 
-  // Auto-select streaming vs normal based on file size
+  // Get file size for progress bar
   size_t file_size = get_file_size(input_file);
+  VLOG("File size: " << file_size << " bytes");
 
-  if (file_size > STREAM_THRESHOLD) {
-    VLOG("File size: " << file_size << " bytes - using STREAMING mode");
-    // TODO: Call streaming function when implemented
-    // For now, fall through to normal encryption with WARNING
-    std::cout << "WARNING: Large file detected (" << (file_size / (1024 * 1024))
-              << " MB)" << std::endl;
-    std::cout << "Processing in memory - may use significant RAM" << std::endl;
-  } else {
-    VLOG("File size: " << file_size << " bytes - using NORMAL mode");
-  }
-
-  // Read input file
+  // Open input file
   std::ifstream infile(input_file, std::ios::binary);
   if (!infile) {
     std::cerr << "Cannot open input file: " << input_file << std::endl;
     exit(1);
   }
 
-  std::vector<unsigned char> data((std::istreambuf_iterator<char>(infile)),
-                                  std::istreambuf_iterator<char>());
-  infile.close();
-
-  // Setup cleanup guard for automatic wiping
+  // Setup cleanup guard
   SensitiveDataGuard guard;
 
   // Generate quantum random salt
   VLOG("Generating quantum random salt...");
   std::vector<unsigned char> salt = fetch_qrng_bytes(SALT_SIZE);
-
   if (salt.size() != SALT_SIZE) {
     std::cerr << "Failed to generate salt from QRNG" << std::endl;
     exit(1);
   }
-
-  // Lock salt in memory
   if (mlock(salt.data(), SALT_SIZE) != 0) {
     std::cerr << "Warning: mlock failed for salt" << std::endl;
   }
   guard.track(salt.data(), SALT_SIZE);
 
-  // Generate quantum random nonce (per-encryption randomness)
+  // Generate quantum random nonce
   VLOG("Generating quantum random nonce...");
   std::vector<unsigned char> nonce = fetch_qrng_bytes(NONCE_SIZE);
-
   if (nonce.size() != NONCE_SIZE) {
     std::cerr << "Failed to generate nonce from QRNG" << std::endl;
     exit(1);
   }
-
-  // Lock nonce in memory
   if (mlock(nonce.data(), NONCE_SIZE) != 0) {
     std::cerr << "Warning: mlock failed for nonce" << std::endl;
   }
@@ -874,54 +1040,107 @@ void perform_encryption(const std::string &input_file,
       derive_key(password.c_str(), password.size(), salt);
   guard.track(key.data(), KEY_SIZE);
 
-  // Encrypt with multi-round enhanced cipher (with progress bar)
-  VLOG("Encrypting (4 rounds with diffusion)...");
+  // Derive round keys for streaming
+  std::vector<std::vector<unsigned char>> round_keys =
+      derive_round_keys(key, nonce);
+  for (auto &rk : round_keys)
+    guard.track(rk.data(), rk.size());
 
-  size_t total_size = data.size();
-  size_t chunk_size = 1024 * 64; // 64KB chunks for progress updates
+  // Initialize HMAC
+  crypto_auth_hmacsha256_state hmac_state;
+  crypto_auth_hmacsha256_init(&hmac_state, key.data(), key.size());
 
-  if (total_size > chunk_size * 2) {
-    // Show progress for larger files
-    for (size_t offset = 0; offset < total_size; offset += chunk_size) {
-      size_t current_chunk = std::min(chunk_size, total_size - offset);
+  // Extract extension
+  std::string original_ext = extract_extension(input_file);
+  if (original_ext.length() > 255) {
+    original_ext = original_ext.substr(0, 255);
+  }
+  unsigned char ext_len = (unsigned char)original_ext.length();
 
-      // Process this chunk (multi-round on subset)
-      std::vector<unsigned char> chunk_data(
-          data.begin() + offset, data.begin() + offset + current_chunk);
-      encrypt_multi_round(chunk_data, key, salt, nonce);
-      std::copy(chunk_data.begin(), chunk_data.end(), data.begin() + offset);
+  // Authenticate metadata (Extension + Nonce)
+  crypto_auth_hmacsha256_update(&hmac_state, &ext_len, 1);
+  if (ext_len > 0) {
+    crypto_auth_hmacsha256_update(
+        &hmac_state, (const unsigned char *)original_ext.c_str(), ext_len);
+  }
+  crypto_auth_hmacsha256_update(&hmac_state, nonce.data(), nonce.size());
 
-      // Update progress
-      show_progress("Encrypting", offset + current_chunk, total_size);
+  // SECURITY: Check if output file exists and is a symlink (prevent overwrite)
+  struct stat output_stat;
+  if (lstat(output_file.c_str(), &output_stat) == 0) {
+    if (S_ISLNK(output_stat.st_mode)) {
+      std::cerr << "SECURITY ERROR: Output file " << output_file
+                << " is a symbolic link! Refusing to overwrite." << std::endl;
+      exit(1);
     }
-  } else {
-    // Small file - no progress bar needed
-    encrypt_multi_round(data, key, salt, nonce);
   }
 
-  // Compute HMAC-SHA256 for authentication (includes nonce in calculation)
-  VLOG("Computing HMAC-SHA256 authentication tag...");
-  std::vector<unsigned char> hmac_input;
-  hmac_input.insert(hmac_input.end(), nonce.begin(), nonce.end());
-  hmac_input.insert(hmac_input.end(), data.begin(), data.end());
-  std::vector<unsigned char> hmac_tag = compute_hmac(hmac_input, key);
-
-  // Write output: [Version][Salt][Nonce][Encrypted Data][HMAC Tag]
+  // Open output file
   std::ofstream outfile(output_file, std::ios::binary);
   if (!outfile) {
     std::cerr << "Cannot write output file: " << output_file << std::endl;
     exit(1);
   }
 
-  VLOG("Writing file format version: " << (int)FILE_FORMAT_VERSION);
+  // Write header
+  VLOG("Writing file header (v2)...");
   outfile.write((char *)&FILE_FORMAT_VERSION, 1);
+
+  // Write extension metadata
+  outfile.write((char *)&ext_len, 1);
+  if (ext_len > 0) {
+    outfile.write(original_ext.c_str(), ext_len);
+  }
+
   outfile.write((char *)salt.data(), salt.size());
   outfile.write((char *)nonce.data(), nonce.size());
-  outfile.write((char *)data.data(), data.size());
-  outfile.write((char *)hmac_tag.data(), hmac_tag.size());
-  outfile.close();
 
-  // SECURITY: Securely delete original file (overwrite before delete)
+  // Streaming Encryption Loop
+  VLOG("Encrypting (streaming mode)...");
+  std::vector<unsigned char> buffer(CHUNK_SIZE);
+  size_t total_processed = 0;
+
+  while (infile) {
+    infile.read((char *)buffer.data(), CHUNK_SIZE);
+    size_t bytes_read = infile.gcount();
+    if (bytes_read == 0)
+      break;
+
+    // Encrypt chunk
+    for (size_t i = 0; i < bytes_read; i++) {
+      size_t pos = total_processed + i;
+      unsigned char keystream = 0;
+      // Combine keystreams from all rounds (XOR is associative)
+      for (int r = 0; r < ENCRYPTION_ROUNDS; r++) {
+        keystream ^= generate_keystream_byte(round_keys[r], salt, nonce, pos);
+      }
+      buffer[i] ^= keystream;
+    }
+
+    // Update HMAC with ciphertext
+    crypto_auth_hmacsha256_update(&hmac_state, buffer.data(), bytes_read);
+
+    // Write ciphertext
+    outfile.write((char *)buffer.data(), bytes_read);
+
+    total_processed += bytes_read;
+
+    // Only show progress bar for files > 128KB
+    if (file_size > PROGRESS_BAR_THRESHOLD) {
+      show_progress("Encrypting", total_processed, file_size);
+    }
+  }
+
+  // Finalize and write HMAC
+  VLOG("Finalizing HMAC...");
+  std::vector<unsigned char> hmac_tag(HMAC_SIZE);
+  crypto_auth_hmacsha256_final(&hmac_state, hmac_tag.data());
+  outfile.write((char *)hmac_tag.data(), HMAC_SIZE);
+
+  outfile.close();
+  infile.close();
+
+  // SECURITY: Securely delete original file
   VLOG("Securely deleting original file...");
   if (!secure_delete_file(input_file)) {
     std::cerr << "Warning: Could not securely delete original file: "
@@ -932,20 +1151,13 @@ void perform_encryption(const std::string &input_file,
   VLOG("  - Encryption: Enhanced Quantum Random Cipher (4 rounds)");
   VLOG("  - Key derivation: Argon2id");
   VLOG("  - Authentication: HMAC-SHA256 (tamper-proof)");
-
-  // SECURITY: Securely wipe sensitive data from memory
-  secure_wipe_vector(key);
-  secure_wipe_vector(salt);
-  secure_wipe_vector(nonce);
-  secure_wipe_vector(data);
-  secure_wipe_vector(hmac_tag);
-  secure_wipe_vector(hmac_input);
+  VLOG("  - Mode: Streaming (Constant RAM usage)");
 }
 
 void perform_decryption(const std::string &input_file,
                         const std::string &output_file,
                         const SecurePassword &password) {
-  // Check if input file exists BEFORE asking for password (UX improvement)
+  // Check if input file exists
   std::ifstream test_file(input_file);
   if (!test_file) {
     std::cerr << "Error: File not found: " << input_file << std::endl;
@@ -953,7 +1165,7 @@ void perform_decryption(const std::string &input_file,
   }
   test_file.close();
 
-  // Read encrypted file
+  // Open input file
   std::ifstream infile(input_file, std::ios::binary);
   if (!infile) {
     std::cerr << "Cannot open input file: " << input_file << std::endl;
@@ -963,63 +1175,57 @@ void perform_decryption(const std::string &input_file,
   // Read and verify version byte
   unsigned char file_version;
   infile.read((char *)&file_version, 1);
-
   if (!infile || infile.gcount() != 1) {
-    std::cerr << "Invalid encrypted file format (cannot read version)"
+    std::cerr << "Invalid encrypted file format" << std::endl;
+    exit(1);
+  }
+
+  // Support v1 and v2
+  if (file_version != 0x01 && file_version != 0x02) {
+    std::cerr << "Unsupported file format version: " << (int)file_version
               << std::endl;
     exit(1);
   }
 
-  VLOG("File format version: " << (int)file_version);
-
-  if (file_version != FILE_FORMAT_VERSION) {
-    std::cerr << "Unsupported file format version: " << (int)file_version
-              << std::endl;
-    std::cerr << "Expected version: " << (int)FILE_FORMAT_VERSION << std::endl;
-    exit(1);
+  // Read extension (v2 only)
+  std::string original_ext = "";
+  if (file_version == 0x02) {
+    unsigned char ext_len;
+    infile.read((char *)&ext_len, 1);
+    if (ext_len > 0) {
+      std::vector<char> ext_buf(ext_len);
+      infile.read(ext_buf.data(), ext_len);
+      if (infile.gcount() != ext_len) {
+        std::cerr << "Invalid encrypted file format (corrupt extension)"
+                  << std::endl;
+        exit(1);
+      }
+      original_ext.assign(ext_buf.begin(), ext_buf.end());
+    }
+  } else {
+    // v1 default
+    original_ext = ".txt";
   }
 
   // Read salt
   std::vector<unsigned char> salt(SALT_SIZE);
   infile.read((char *)salt.data(), SALT_SIZE);
-
   if (infile.gcount() != SALT_SIZE) {
     std::cerr << "Invalid encrypted file format" << std::endl;
     exit(1);
   }
 
-  // Read encrypted data + HMAC tag
-  std::vector<unsigned char> data((std::istreambuf_iterator<char>(infile)),
-                                  std::istreambuf_iterator<char>());
-  infile.close();
-
-  // Check minimum size: nonce + encrypted data + HMAC tag
-  if (data.size() < (NONCE_SIZE + HMAC_SIZE)) {
-    std::cerr << "Invalid encrypted file format (file too small)" << std::endl;
+  // Read nonce
+  std::vector<unsigned char> nonce(NONCE_SIZE);
+  infile.read((char *)nonce.data(), NONCE_SIZE);
+  if (infile.gcount() != NONCE_SIZE) {
+    std::cerr << "Invalid encrypted file format" << std::endl;
     exit(1);
   }
 
-  // Extract nonce (first 16 bytes after salt)
-  std::vector<unsigned char> nonce(data.begin(), data.begin() + NONCE_SIZE);
-  data.erase(data.begin(), data.begin() + NONCE_SIZE);
-
-  // Extract HMAC tag (last 32 bytes)
-  std::vector<unsigned char> hmac_tag(data.end() - HMAC_SIZE, data.end());
-  data.erase(data.end() - HMAC_SIZE, data.end());
-
   // Setup cleanup guard
   SensitiveDataGuard guard;
-
-  // Lock salt in memory
-  if (mlock(salt.data(), SALT_SIZE) != 0) {
-    std::cerr << "Warning: mlock failed for salt" << std::endl;
-  }
   guard.track(salt.data(), SALT_SIZE);
-
-  // Lock nonce in memory
-  if (mlock(nonce.data(), NONCE_SIZE) != 0) {
-    std::cerr << "Warning: mlock failed for nonce" << std::endl;
-  }
   guard.track(nonce.data(), NONCE_SIZE);
 
   // Derive key
@@ -1028,73 +1234,142 @@ void perform_decryption(const std::string &input_file,
       derive_key(password.c_str(), password.size(), salt);
   guard.track(key.data(), KEY_SIZE);
 
-  // CRITICAL: Verify HMAC BEFORE decrypting (prevents tampering)
-  VLOG("Verifying HMAC-SHA256 authentication tag...");
-  std::vector<unsigned char> hmac_input;
-  hmac_input.insert(hmac_input.end(), nonce.begin(), nonce.end());
-  hmac_input.insert(hmac_input.end(), data.begin(), data.end());
+  // Derive round keys
+  std::vector<std::vector<unsigned char>> round_keys =
+      derive_round_keys(key, nonce);
+  for (auto &rk : round_keys)
+    guard.track(rk.data(), rk.size());
 
-  if (!verify_hmac(hmac_input, hmac_tag, key)) {
+  // Determine data size
+  size_t header_size = 1 + SALT_SIZE + NONCE_SIZE;
+  if (file_version == 0x02) {
+    header_size += 1 + original_ext.length();
+  }
+
+  size_t file_size = get_file_size(input_file);
+  if (file_size < header_size + HMAC_SIZE) {
+    std::cerr << "Invalid encrypted file format (too small)" << std::endl;
+    exit(1);
+  }
+  size_t data_size = file_size - header_size - HMAC_SIZE;
+
+  // PASS 1: Verify HMAC (Streaming)
+  VLOG("Verifying HMAC-SHA256 (Pass 1/2)...");
+
+  crypto_auth_hmacsha256_state hmac_state;
+  crypto_auth_hmacsha256_init(&hmac_state, key.data(), key.size());
+
+  // Authenticate metadata (v2 only)
+  if (file_version == 0x02) {
+    unsigned char ext_len = (unsigned char)original_ext.length();
+    crypto_auth_hmacsha256_update(&hmac_state, &ext_len, 1);
+    if (ext_len > 0) {
+      crypto_auth_hmacsha256_update(
+          &hmac_state, (const unsigned char *)original_ext.c_str(), ext_len);
+    }
+  }
+
+  crypto_auth_hmacsha256_update(&hmac_state, nonce.data(), nonce.size());
+
+  std::vector<unsigned char> buffer(CHUNK_SIZE);
+  size_t total_verified = 0;
+
+  // Save position of data start
+  std::streampos data_start = infile.tellg();
+
+  while (total_verified < data_size) {
+    size_t to_read = std::min(CHUNK_SIZE, data_size - total_verified);
+    infile.read((char *)buffer.data(), to_read);
+
+    crypto_auth_hmacsha256_update(&hmac_state, buffer.data(), to_read);
+    total_verified += to_read;
+
+    // Only show progress bar for files > 128KB
+    if (data_size > PROGRESS_BAR_THRESHOLD) {
+      show_progress("Verifying", total_verified, data_size);
+    }
+  }
+
+  // Read file's HMAC tag
+  std::vector<unsigned char> file_hmac(HMAC_SIZE);
+  infile.read((char *)file_hmac.data(), HMAC_SIZE);
+  if (infile.gcount() != HMAC_SIZE) {
+    std::cerr << "Invalid encrypted file format (corrupt HMAC)" << std::endl;
+    exit(1);
+  }
+
+  // Finalize and compare
+  std::vector<unsigned char> calculated_hmac(HMAC_SIZE);
+  crypto_auth_hmacsha256_final(&hmac_state, calculated_hmac.data());
+
+  if (sodium_memcmp(calculated_hmac.data(), file_hmac.data(), HMAC_SIZE) != 0) {
     std::cerr << "\n[ERROR] Authentication failed! File has been tampered with "
                  "or password is incorrect."
               << std::endl;
-    std::cerr << "HMAC-SHA256 verification failed. Aborting decryption."
-              << std::endl;
     exit(1);
   }
-  VLOG("✓ Authentication successful - file integrity verified");
+  VLOG("✓ Authentication successful");
 
-  // Decrypt with multi-round enhanced cipher (with progress bar)
-  VLOG("Decrypting (4 rounds with diffusion)...");
+  // PASS 2: Decrypt (Streaming)
+  VLOG("Decrypting (Pass 2/2)...");
 
-  size_t total_size = data.size();
-  size_t chunk_size = 1024 * 64; // 64KB chunks for progress updates
-
-  if (total_size > chunk_size * 2) {
-    // Show progress for larger files
-    for (size_t offset = 0; offset < total_size; offset += chunk_size) {
-      size_t current_chunk = std::min(chunk_size, total_size - offset);
-
-      // Process this chunk (multi-round on subset)
-      std::vector<unsigned char> chunk_data(
-          data.begin() + offset, data.begin() + offset + current_chunk);
-      decrypt_multi_round(chunk_data, key, salt, nonce);
-      std::copy(chunk_data.begin(), chunk_data.end(), data.begin() + offset);
-
-      // Update progress
-      show_progress("Decrypting", offset + current_chunk, total_size);
+  // SECURITY: Check output symlink
+  struct stat output_stat;
+  if (lstat(output_file.c_str(), &output_stat) == 0) {
+    if (S_ISLNK(output_stat.st_mode)) {
+      std::cerr << "SECURITY ERROR: Output file " << output_file
+                << " is a symbolic link! Refusing to overwrite." << std::endl;
+      exit(1);
     }
-  } else {
-    // Small file - no progress bar needed
-    decrypt_multi_round(data, key, salt, nonce);
   }
 
-  // Write output
   std::ofstream outfile(output_file, std::ios::binary);
   if (!outfile) {
     std::cerr << "Cannot write output file: " << output_file << std::endl;
     exit(1);
   }
 
-  outfile.write((char *)data.data(), data.size());
-  outfile.close();
+  // Seek back to data start
+  infile.clear();
+  infile.seekg(data_start);
 
-  // SECURITY: Securely delete encrypted file (overwrite before delete)
+  size_t total_decrypted = 0;
+  while (total_decrypted < data_size) {
+    size_t to_read = std::min(CHUNK_SIZE, data_size - total_decrypted);
+    infile.read((char *)buffer.data(), to_read);
+
+    // Decrypt chunk
+    for (size_t i = 0; i < to_read; i++) {
+      size_t pos = total_decrypted + i;
+      unsigned char keystream = 0;
+      // Combine keystreams from all rounds (same order as encryption)
+      for (int r = 0; r < ENCRYPTION_ROUNDS; r++) {
+        keystream ^= generate_keystream_byte(round_keys[r], salt, nonce, pos);
+      }
+      buffer[i] ^= keystream;
+    }
+
+    outfile.write((char *)buffer.data(), to_read);
+    total_decrypted += to_read;
+
+    // Only show progress bar for files > 128KB
+    if (data_size > PROGRESS_BAR_THRESHOLD) {
+      show_progress("Decrypting", total_decrypted, data_size);
+    }
+  }
+
+  outfile.close();
+  infile.close();
+
+  // SECURITY: Securely delete encrypted file
   VLOG("Securely deleting encrypted file...");
   if (!secure_delete_file(input_file)) {
-    std::cerr << "Warning: Could not securely delete encrypted file: "
-              << input_file << std::endl;
+    std::cerr << "Warning: Could not securely delete encrypted file"
+              << std::endl;
   }
 
   std::cout << "✓ Decrypted: " << output_file << std::endl;
-
-  // SECURITY: Securely wipe sensitive data from memory
-  secure_wipe_vector(key);
-  secure_wipe_vector(salt);
-  secure_wipe_vector(nonce);
-  secure_wipe_vector(data);
-  secure_wipe_vector(hmac_tag);
-  secure_wipe_vector(hmac_input);
+  VLOG("  - Mode: Streaming (Constant RAM usage)");
 }
 
 //
@@ -1143,7 +1418,17 @@ int main(int argc, char *argv[]) {
   std::string output_file;
 
   // Auto-generate output filename if not provided
+  // SECURITY FIX: Check if argv[3] is actually a filename, not a flag
   if (argc == 4) {
+    std::string potential_output = argv[3];
+    // If it's a flag, auto-generate instead
+    if (potential_output == "--verbose" || potential_output == "-v") {
+      output_file = auto_generate_output_filename(input_file, mode);
+    } else {
+      output_file = potential_output;
+    }
+  } else if (argc == 5) {
+    // Format: ./qre mode input output --verbose
     output_file = argv[3];
   } else {
     output_file = auto_generate_output_filename(input_file, mode);

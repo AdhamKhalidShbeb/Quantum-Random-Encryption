@@ -1,0 +1,25 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.exe
+qre
+Quantum_Random_Encryption
+
+# IDE files
+.vscode/*
+!.vscode/c_cpp_properties.json
+!.vscode/settings.json
+.clangd/
+.cache/
+
+# Temporary files
+*.qre
+*.tmp
+*~
+.DS_Store
+
+# Test files
+test_*.txt
+test_*.sh.o

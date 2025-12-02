@@ -1,0 +1,6 @@
+CompileFlags:
+  Add:
+    - "-I/mnt/VMDrive/Programming Projects/Quantum Random Encryption (QRE)/include"
+    - "-std=c++17"
+  Remove:
+    - "-W*"
