@@ -233,8 +233,8 @@ const unsigned long long ARGON2_OPS = 3;                   // 3 iterations
 
 const int KEY_SIZE = 32; // 256 bits for AES-256
 const int SALT_SIZE = 128;
-const int NONCE_SIZE = 12;   // 96-bit nonce for GCM
-const int GCM_TAG_SIZE = 16; // GCM authentication tag (128 bits)
+const int NONCE_SIZE = 12; // 96-bit nonce for GCM
+
 const int DELAY_SECONDS = 4;
 
 const int MIN_PASSWORD_LENGTH = 16;
@@ -243,16 +243,11 @@ const int MIN_LOWERCASE = 2;
 const int MIN_DIGITS = 2;
 const int MIN_SYMBOLS = 2;
 
-// Streaming encryption settings
+// Buffer size for reading files
 const size_t CHUNK_SIZE = 1024 * 1024; // 1MB chunks
-const size_t STREAM_THRESHOLD =
-    100 * 1024 * 1024; // Use streaming for files > 100MB
-const size_t PROGRESS_UPDATE_INTERVAL = 64 * 1024; // Update progress every 64KB
-const size_t PROGRESS_BAR_THRESHOLD =
-    128 * 1024; // Show progress bar for files > 128KB
 
 // File format version
-const unsigned char FILE_FORMAT_VERSION = 0x03; // V3: AES-256-GCM
+const unsigned char FILE_FORMAT_VERSION = 0x03; // AES-256-GCM
 
 // Global verbose flag (set via command line)
 bool VERBOSE = false;
@@ -260,41 +255,6 @@ bool VERBOSE = false;
 // Compile-time safety checks
 static_assert(KEY_SIZE == 32, "KEY_SIZE must be 32 bytes for AES-256");
 static_assert(NONCE_SIZE == 12, "NONCE_SIZE must be 12 bytes for GCM");
-
-//
-// PROGRESS DISPLAY
-//
-
-void show_progress(const std::string &operation, size_t current, size_t total) {
-  if (total == 0)
-    return;
-
-  // Use 64-bit arithmetic to prevent overflow for very large files
-  int percent = (int)((current * 100ULL) / total);
-  int bar_width = 20;
-  int filled = (int)(((unsigned long long)current * bar_width) / total);
-
-  // Format sizes in MB
-  double current_mb = current / (1024.0 * 1024.0);
-  double total_mb = total / (1024.0 * 1024.0);
-
-  // Build progress bar
-  std::cout << "\r" << operation << ": [";
-  for (int i = 0; i < bar_width; i++) {
-    if (i < filled)
-      std::cout << "█";
-    else
-      std::cout << "░";
-  }
-  std::cout << "] " << percent << "% (";
-  printf("%.1f MB / %.1f MB)", current_mb, total_mb);
-  std::cout << std::flush;
-
-  // New line when complete
-  if (current >= total) {
-    std::cout << std::endl;
-  }
-}
 
 //
 // VERBOSE LOGGING
@@ -728,12 +688,12 @@ std::string auto_generate_output_filename(const std::string &input,
     }
     return input + ".qre";
   } else {
-    // Decrypt mode: Try to recover original extension from header
+    // Decrypt mode: Recover original extension from header
     std::ifstream infile(input, std::ios::binary);
     if (infile) {
-      unsigned char ver;
-      infile.read((char *)&ver, 1);
-      if (infile.gcount() == 1 && ver == 0x02) {
+      // Skip version byte (1 byte)
+      infile.seekg(1, std::ios::beg);
+      if (infile) {
         unsigned char ext_len;
         infile.read((char *)&ext_len, 1);
         if (infile.gcount() == 1 && ext_len > 0) {
@@ -790,7 +750,7 @@ size_t get_file_size(const std::string &filename) {
 void perform_encryption(const std::string &input_file,
                         const std::string &output_file,
                         const SecurePassword &password) {
-  // Check if input file exists BEFORE asking for password (UX improvement)
+  // Check if input file exists before asking for password
   std::ifstream test_file(input_file);
   if (!test_file) {
     std::cerr << "Error: File not found: " << input_file << std::endl;
@@ -919,8 +879,8 @@ void perform_encryption(const std::string &input_file,
   // Securely wipe plaintext
   secure_wipe_vector(plaintext);
 
-  // Write header (V3 format)
-  VLOG("Writing file header (v3)...");
+  // Write file header
+  VLOG("Writing file header...");
   unsigned char header[2] = {FILE_FORMAT_VERSION, ext_len};
   if (write(out_fd, header, 2) != 2) {
     std::cerr << "Error: Failed to write file header" << std::endl;
@@ -995,29 +955,22 @@ void perform_decryption(const std::string &input_file,
     exit(1);
   }
 
-  // Read and verify version byte
-  unsigned char file_version;
-  infile.read((char *)&file_version, 1);
+  // Verify file format version
+  unsigned char version;
+  infile.read((char *)&version, 1);
   if (!infile || infile.gcount() != 1) {
     std::cerr << "Invalid encrypted file format" << std::endl;
     exit(1);
   }
 
-  // Support v3 (AES-256-GCM) only - v2 backward compat would require keeping
-  // old cipher code
-  if (file_version != 0x03 && file_version != 0x02) {
-    std::cerr << "Unsupported file format version: " << (int)file_version
+  if (version != 0x03) {
+    std::cerr << "Invalid file format version: " << (int)version << std::endl;
+    std::cerr << "This file may be corrupted or not a valid QRE encrypted file."
               << std::endl;
-    if (file_version == 0x02) {
-      std::cerr << "Note: V2 files cannot be decrypted by this version."
-                << std::endl;
-      std::cerr << "      Please use QRE V3.0 to decrypt V2 files."
-                << std::endl;
-    }
     exit(1);
   }
 
-  // Read extension (v2 and v3)
+  // Read original file extension from header
   std::string original_ext = "";
   unsigned char ext_len;
   infile.read((char *)&ext_len, 1);
@@ -1040,11 +993,10 @@ void perform_decryption(const std::string &input_file,
     exit(1);
   }
 
-  // Read nonce (size depends on version)
-  size_t nonce_size_for_version = (file_version == 0x03) ? 12 : 16;
-  std::vector<unsigned char> nonce(nonce_size_for_version);
-  infile.read((char *)nonce.data(), nonce_size_for_version);
-  if (static_cast<size_t>(infile.gcount()) != nonce_size_for_version) {
+  // Read nonce (12 bytes for AES-256-GCM)
+  std::vector<unsigned char> nonce(NONCE_SIZE);
+  infile.read((char *)nonce.data(), NONCE_SIZE);
+  if (static_cast<size_t>(infile.gcount()) != NONCE_SIZE) {
     std::cerr << "Invalid encrypted file format" << std::endl;
     exit(1);
   }
@@ -1052,7 +1004,7 @@ void perform_decryption(const std::string &input_file,
   // Setup cleanup guard
   SensitiveDataGuard guard;
   guard.track(salt.data(), SALT_SIZE);
-  guard.track(nonce.data(), nonce_size_for_version);
+  guard.track(nonce.data(), NONCE_SIZE);
 
   // Derive key
   VLOG("Deriving decryption key...");
@@ -1060,78 +1012,68 @@ void perform_decryption(const std::string &input_file,
       derive_key(password.c_str(), password.size(), salt);
   guard.track(key.data(), KEY_SIZE);
 
-  // V3: AES-256-GCM decryption
-  if (file_version == 0x03) {
-    VLOG("Decrypting with AES-256-GCM...");
+  VLOG("Decrypting with AES-256-GCM...");
 
-    // Read entire ciphertext (includes 16-byte GCM tag)
-    size_t file_size = get_file_size(input_file);
-    size_t header_size =
-        1 + 1 + original_ext.length() + SALT_SIZE + nonce_size_for_version;
-    size_t ciphertext_size = file_size - header_size;
+  // Read entire ciphertext (includes 16-byte GCM tag)
+  size_t file_size = get_file_size(input_file);
+  size_t header_size = 1 + 1 + original_ext.length() + SALT_SIZE + NONCE_SIZE;
+  size_t ciphertext_size = file_size - header_size;
 
-    std::vector<unsigned char> ciphertext(ciphertext_size);
-    infile.read((char *)ciphertext.data(), ciphertext_size);
-    if ((size_t)infile.gcount() != ciphertext_size) {
-      std::cerr << "Invalid encrypted file format (incomplete ciphertext)"
-                << std::endl;
-      exit(1);
-    }
-
-    // Decrypt (also verifies authentication tag)
-    std::vector<unsigned char> plaintext =
-        decrypt_aes256gcm(ciphertext, key, nonce);
-
-    if (plaintext.empty()) {
-      std::cerr << "\n[ERROR] Decryption failed! Wrong password or file has "
-                   "been tampered with."
-                << std::endl;
-      exit(1);
-    }
-
-    VLOG("✓ Authentication and decryption successful");
-
-    // SECURITY: Atomically create output file with O_CREAT | O_EXCL |
-    // O_NOFOLLOW
-    int out_fd = open(output_file.c_str(),
-                      O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
-    if (out_fd < 0) {
-      if (errno == EEXIST) {
-        std::cerr << "Error: Output file already exists: " << output_file
-                  << std::endl;
-      } else if (errno == ELOOP) {
-        std::cerr << "SECURITY ERROR: Output file is a symbolic link!"
-                  << std::endl;
-      } else {
-        std::cerr << "Cannot create output file: " << output_file << std::endl;
-      }
-      exit(1);
-    }
-
-    // Write decrypted data
-    if (write(out_fd, plaintext.data(), plaintext.size()) !=
-        (ssize_t)plaintext.size()) {
-      std::cerr << "Error: Failed to write decrypted data (disk full?)"
-                << std::endl;
-      close(out_fd);
-      exit(1);
-    }
-
-    if (fsync(out_fd) != 0) {
-      std::cerr << "Warning: Failed to sync file to disk" << std::endl;
-    }
-
-    close(out_fd);
-
-    // Securely wipe plaintext
-    secure_wipe_vector(plaintext);
-  } else {
-    // V2 not supported (old cipher code removed)
-    std::cerr << "Error: V2 format not supported in this version." << std::endl;
-    std::cerr << "Please use an older version of QRE to decrypt V2 files."
+  std::vector<unsigned char> ciphertext(ciphertext_size);
+  infile.read((char *)ciphertext.data(), ciphertext_size);
+  if ((size_t)infile.gcount() != ciphertext_size) {
+    std::cerr << "Invalid encrypted file format (incomplete ciphertext)"
               << std::endl;
     exit(1);
   }
+
+  // Decrypt (also verifies authentication tag)
+  std::vector<unsigned char> plaintext =
+      decrypt_aes256gcm(ciphertext, key, nonce);
+
+  if (plaintext.empty()) {
+    std::cerr << "\n[ERROR] Decryption failed! Wrong password or file has "
+                 "been tampered with."
+              << std::endl;
+    exit(1);
+  }
+
+  VLOG("✓ Authentication and decryption successful");
+
+  // SECURITY: Atomically create output file with O_CREAT | O_EXCL |
+  // O_NOFOLLOW
+  int out_fd =
+      open(output_file.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (out_fd < 0) {
+    if (errno == EEXIST) {
+      std::cerr << "Error: Output file already exists: " << output_file
+                << std::endl;
+    } else if (errno == ELOOP) {
+      std::cerr << "SECURITY ERROR: Output file is a symbolic link!"
+                << std::endl;
+    } else {
+      std::cerr << "Cannot create output file: " << output_file << std::endl;
+    }
+    exit(1);
+  }
+
+  // Write decrypted data
+  if (write(out_fd, plaintext.data(), plaintext.size()) !=
+      (ssize_t)plaintext.size()) {
+    std::cerr << "Error: Failed to write decrypted data (disk full?)"
+              << std::endl;
+    close(out_fd);
+    exit(1);
+  }
+
+  if (fsync(out_fd) != 0) {
+    std::cerr << "Warning: Failed to sync file to disk" << std::endl;
+  }
+
+  close(out_fd);
+
+  // Securely wipe plaintext
+  secure_wipe_vector(plaintext);
 
   infile.close();
 
@@ -1200,7 +1142,7 @@ int main(int argc, char *argv[]) {
   std::string output_file;
 
   // Auto-generate output filename if not provided
-  // SECURITY FIX: Check if argv[3] is actually a filename, not a flag
+  // Check if argv[3] is a filename or flag
   if (argc == 4) {
     std::string potential_output = argv[3];
     // If it's a flag, auto-generate instead
@@ -1240,7 +1182,7 @@ int main(int argc, char *argv[]) {
     return 1;
   }
 
-  // Check if input file exists BEFORE asking for password (UX improvement)
+  // Check if input file exists before asking for password
   std::ifstream test_file(input_file);
   if (!test_file) {
     std::cerr << "Error: File not found: " << input_file << std::endl;
