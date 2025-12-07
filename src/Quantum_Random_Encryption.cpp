@@ -18,6 +18,10 @@
 #include "compression/CompressionManager.hpp"
 #include "entropy/EntropyManager.hpp"
 #include "password_blacklist.hpp"
+#include "utils/TarManager.hpp"
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 //
 // SECURE MEMORY UTILITIES
@@ -337,6 +341,10 @@ std::string get_password_hidden() {
   std::getline(std::cin, password);
   std::cout << std::endl;
 
+  if (std::cin.eof()) {
+    return password;
+  }
+
   return password;
 }
 
@@ -582,6 +590,10 @@ SecurePassword get_valid_password_for_encryption() {
     temp_password = get_password_hidden();
 
     if (temp_password.empty()) {
+      if (std::cin.eof()) {
+        std::cerr << "\n[ERROR] EOF reading password" << std::endl;
+        exit(1);
+      }
       std::cerr << "\n[ERROR] Password cannot be empty!" << std::endl;
       continue;
     }
@@ -781,9 +793,6 @@ void perform_encryption(const std::string &input_file,
     exit(1);
   }
 
-  // Setup cleanup guard
-  SensitiveDataGuard guard;
-
   // Generate hardware random salt
   VLOG("Generating hardware random salt...");
   std::vector<unsigned char> salt =
@@ -796,7 +805,6 @@ void perform_encryption(const std::string &input_file,
   if (mlock(salt.data(), SALT_SIZE) != 0) {
     std::cerr << "Warning: mlock failed for salt" << std::endl;
   }
-  guard.track(salt.data(), SALT_SIZE);
 
   // Generate hardware random nonce
   VLOG("Generating hardware random nonce...");
@@ -810,12 +818,17 @@ void perform_encryption(const std::string &input_file,
   if (mlock(nonce.data(), NONCE_SIZE) != 0) {
     std::cerr << "Warning: mlock failed for nonce" << std::endl;
   }
-  guard.track(nonce.data(), NONCE_SIZE);
 
   // Derive key
   VLOG("Deriving 256-bit AES encryption key...");
   std::vector<unsigned char> key =
       derive_key(password.c_str(), password.size(), salt);
+
+  // Setup cleanup guard AFTER vectors are created to ensure it runs BEFORE
+  // vectors are destroyed
+  SensitiveDataGuard guard;
+  guard.track(salt.data(), SALT_SIZE);
+  guard.track(nonce.data(), NONCE_SIZE);
   guard.track(key.data(), KEY_SIZE);
 
   // Extract extension
@@ -1042,15 +1055,15 @@ void perform_decryption(const std::string &input_file,
     exit(1);
   }
 
-  // Setup cleanup guard
-  SensitiveDataGuard guard;
-  guard.track(salt.data(), SALT_SIZE);
-  guard.track(nonce.data(), NONCE_SIZE);
-
   // Derive key
   VLOG("Deriving decryption key...");
   std::vector<unsigned char> key =
       derive_key(password.c_str(), password.size(), salt);
+
+  // Setup cleanup guard AFTER vectors are created
+  SensitiveDataGuard guard;
+  guard.track(salt.data(), SALT_SIZE);
+  guard.track(nonce.data(), NONCE_SIZE);
   guard.track(key.data(), KEY_SIZE);
 
   VLOG("Decrypting with AES-256-GCM...");
@@ -1222,16 +1235,21 @@ int main(int argc, char *argv[]) {
   // Run self-test
   if (!self_test()) {
     std::cerr << "Self-test failed! Cannot continue." << std::endl;
-
     return 1;
   }
 
-  if (argc < 3 || argc > 7) {
+  if (argc < 3) {
     std::cout << "Usage:\n";
     std::cout << "  Encrypt: " << argv[0]
-              << " encrypt <input.txt> [output.qre] [options]\n";
+              << " encrypt <input> [output] [options]\n";
+    std::cout << "           " << argv[0]
+              << " encrypt <file1> <file2> ... [options]\n";
+    std::cout << "           " << argv[0]
+              << " encrypt <directory/> [options]\n";
     std::cout << "  Decrypt: " << argv[0]
-              << " decrypt <input.qre> [output.txt] [options]\n";
+              << " decrypt <input.qre> [output] [options]\n";
+    std::cout << "           " << argv[0]
+              << " decrypt <file1.qre> <file2.qre> ... [options]\n";
     std::cout << "\nOptions:\n";
     std::cout << "  --verbose, -v         Enable debug logging\n";
     std::cout << "  --compress-fast       Fast compression (zstd level 1)\n";
@@ -1240,9 +1258,12 @@ int main(int argc, char *argv[]) {
     std::cout
         << "  --compress-max        Maximum compression (zstd level 15)\n";
     std::cout << "  --compress-ultra      Ultra compression (zstd level 22)\n";
-    std::cout
-        << "\nIf output file is not specified, it will be auto-generated.\n";
-    std::cout << "Compression only applies to encryption.\n";
+    std::cout << "\nBatch Operations:\n";
+    std::cout << "  - Multiple files can be processed at once.\n";
+    std::cout << "  - Directories are automatically archived (tar) before "
+                 "encryption.\n";
+    std::cout << "  - If multiple inputs are provided, output filenames are "
+                 "auto-generated.\n";
 
     return 1;
   }
@@ -1263,61 +1284,177 @@ int main(int argc, char *argv[]) {
   }
 
   std::string mode = positional_args[0];
-  std::string input_file = positional_args[1];
-  std::string output_file;
-
-  // Auto-generate output filename if not provided
-  if (positional_args.size() >= 3) {
-    output_file = positional_args[2];
-  } else {
-    output_file = auto_generate_output_filename(input_file, mode);
-  }
-
-  // SECURITY: Validate file paths
-  if (!is_safe_path(input_file)) {
-    std::cerr << "ERROR: Input file path contains unsafe characters (path "
-                 "traversal attempt?)"
-              << std::endl;
-
-    return 1;
-  }
-  if (!is_safe_path(output_file)) {
-    std::cerr << "ERROR: Output file path contains unsafe characters (path "
-                 "traversal attempt?)"
-              << std::endl;
-
-    return 1;
-  }
-
-  // SECURITY: Prevent input == output (would corrupt file)
-  if (input_file == output_file) {
-    std::cerr << "ERROR: Input and output files cannot be the same!"
-              << std::endl;
-
-    return 1;
-  }
-
-  // Check if input file exists before asking for password
-  std::ifstream test_file(input_file);
-  if (!test_file) {
-    std::cerr << "Error: File not found: " << input_file << std::endl;
-
-    return 1;
-  }
-  test_file.close();
-
-  // Get password
-  if (mode == "encrypt") {
-    SecurePassword password = get_valid_password_for_encryption();
-    perform_encryption(input_file, output_file, password);
-  } else if (mode == "decrypt") {
-    SecurePassword password = get_password_for_decryption();
-    perform_decryption(input_file, output_file, password);
-  } else {
+  if (mode != "encrypt" && mode != "decrypt") {
     std::cerr << "Invalid mode. Use 'encrypt' or 'decrypt'" << std::endl;
-
     return 1;
   }
 
-  return 0;
+  // Identify inputs and outputs
+  struct Task {
+    std::string input;
+    std::string output;
+    bool is_directory;
+    std::string temp_tar_file; // If directory, this is the intermediate tar
+  };
+  std::vector<Task> tasks;
+
+  // Logic to distinguish "input output" vs "input1 input2"
+  bool explicit_output = false;
+  if (positional_args.size() == 3) {
+    // Check if second arg exists
+    std::string arg2 = positional_args[2];
+    if (fs::exists(arg2)) {
+      // Both exist -> Treat as two inputs
+      // UNLESS in decrypt mode and arg2 is a directory (output dir? not
+      // supported yet) For now, if it exists, it's an input. Warning: If user
+      // intended to overwrite arg2, this will treat it as input! But O_EXCL
+      // prevents overwrite anyway, so this is safe.
+      explicit_output = false;
+    } else {
+      // arg2 does not exist -> Treat as output for arg1
+      explicit_output = true;
+    }
+  }
+
+  if (explicit_output) {
+    // Single file case with explicit output
+    Task t;
+    t.input = positional_args[1];
+    t.output = positional_args[2];
+    t.is_directory = fs::is_directory(t.input);
+    tasks.push_back(t);
+  } else {
+    // Batch mode (multiple inputs, auto-generated outputs)
+    for (size_t i = 1; i < positional_args.size(); ++i) {
+      Task t;
+      t.input = positional_args[i];
+      t.is_directory = fs::is_directory(t.input);
+
+      if (t.is_directory && mode == "decrypt") {
+        std::cerr << "Error: Cannot decrypt a directory: " << t.input
+                  << std::endl;
+        continue;
+      }
+
+      if (t.is_directory) {
+        // For directory, we'll tar it first
+        // Output will be dir_name.qre (which contains the tar)
+        // We need to strip trailing slash if present for the filename
+        std::string clean_path = t.input;
+        if (clean_path.back() == '/')
+          clean_path.pop_back();
+
+        t.output = clean_path + ".qre";
+        t.temp_tar_file = clean_path + ".tar";
+      } else {
+        t.output = auto_generate_output_filename(t.input, mode);
+      }
+      tasks.push_back(t);
+    }
+  }
+
+  if (tasks.empty()) {
+    std::cerr << "No valid tasks found." << std::endl;
+    return 1;
+  }
+
+  // Get password once
+  SecurePassword password = (mode == "encrypt")
+                                ? get_valid_password_for_encryption()
+                                : get_password_for_decryption();
+
+  // Process tasks
+  int success_count = 0;
+  int fail_count = 0;
+
+  for (auto &task : tasks) {
+    std::cout << "\nProcessing: " << task.input << "..." << std::endl;
+
+    // Handle Directory Encryption
+    if (task.is_directory && mode == "encrypt") {
+      VLOG("Input is a directory. Creating tar archive...");
+      if (!QRE::TarManager::create_archive(task.input, task.temp_tar_file)) {
+        std::cerr << "Failed to create tar archive for " << task.input
+                  << std::endl;
+        fail_count++;
+        continue;
+      }
+
+      // Now encrypt the tar file
+      // We use the temp tar file as input for encryption
+      // The output is task.output (e.g., dir.qre)
+      try {
+        perform_encryption(task.temp_tar_file, task.output, password);
+        success_count++;
+
+        // Securely delete the temp tar file
+        secure_delete_file(task.temp_tar_file);
+      } catch (...) {
+        std::cerr << "Encryption failed for " << task.input << std::endl;
+        secure_delete_file(task.temp_tar_file); // Cleanup
+        fail_count++;
+      }
+    }
+    // Handle Normal File Encryption/Decryption
+    else {
+      // SECURITY: Validate file paths
+      if (!is_safe_path(task.input) || !is_safe_path(task.output)) {
+        std::cerr << "Skipping unsafe path: " << task.input << std::endl;
+        fail_count++;
+        continue;
+      }
+
+      if (task.input == task.output) {
+        std::cerr << "Skipping: Input and output are the same: " << task.input
+                  << std::endl;
+        fail_count++;
+        continue;
+      }
+
+      try {
+        if (mode == "encrypt") {
+          perform_encryption(task.input, task.output, password);
+        } else {
+          perform_decryption(task.input, task.output, password);
+
+          // Check if decrypted file is a tar (simple check by extension for
+          // now) If we decrypted "dir.qre" -> "dir.tar" (if stored ext was
+          // .tar) Or if original input was "dir.tar.qre" -> "dir.tar"
+          if (task.output.size() > 4 &&
+              task.output.substr(task.output.size() - 4) == ".tar") {
+            std::cout << "Detected TAR archive: " << task.output << std::endl;
+            std::cout << "Extracting..." << std::endl;
+
+            // Extract to current directory (or maybe a folder with the name of
+            // the tar?) Let's extract to current dir for now to match behavior
+            // of "tar -xf"
+            if (QRE::TarManager::extract_archive(task.output)) {
+              std::cout << "✓ Extracted archive" << std::endl;
+
+              // Cleanup: Delete the intermediate tar file
+              VLOG("Deleting intermediate tar file...");
+              if (secure_delete_file(task.output)) {
+                std::cout << "✓ Removed intermediate file: " << task.output
+                          << std::endl;
+              } else {
+                std::cerr << "Warning: Failed to delete intermediate file: "
+                          << task.output << std::endl;
+              }
+            } else {
+              std::cerr << "Warning: Failed to extract archive" << std::endl;
+            }
+          }
+        }
+        success_count++;
+      } catch (...) {
+        std::cerr << "Operation failed for " << task.input << std::endl;
+        fail_count++;
+      }
+    }
+  }
+
+  std::cout << "\nSummary: " << success_count << " succeeded, " << fail_count
+            << " failed." << std::endl;
+
+  return (fail_count == 0) ? 0 : 1;
 }
